@@ -1,5 +1,6 @@
 import type { ChunkDataPool, ChunkSource } from './chunk';
 import { dataTableToChunkSource, materializeToDataTable } from './compat/data-table';
+import { decimateSourceVoxel } from './decimate-voxel';
 import {
     computeSourceStats,
     filterByValueRows,
@@ -136,10 +137,11 @@ const processSource = async (
  * chunk-native runs and bridging only the DataTable-only runs. Consecutive
  * actions are grouped into maximal same-mode runs (order preserved): a
  * chunk-native run ({@link SOURCE_ACTION_KINDS}) goes through {@link processSource};
- * a DataTable-only run (decimate, the GPU voxel filters, …)
+ * a DataTable-only run (uniform decimation, the GPU voxel filters, …)
  * materializes once, runs `processDataTable`, and re-bridges to a source via
  * `dataTableToChunkSource`. So the not-yet-chunked ops do their work inline as
- * islands and everything around them keeps streaming.
+ * islands and everything around them keeps streaming. Voxel decimation runs
+ * directly on the source with its own bounded working storage.
  *
  * @param source - The input source (consumed; the returned source owns it).
  * @param actions - Actions to apply in order.
@@ -156,9 +158,30 @@ const processSourceBridged = async (
     let src = source;
     let i = 0;
     while (i < actions.length) {
+        const action = actions[i];
+        if (action.kind === 'decimate' && action.method === 'voxel') {
+            const targetCount =
+                action.count === null
+                    ? Math.round((src.meta.numGaussians * (action.percent ?? 100)) / 100)
+                    : Math.min(action.count, src.meta.numGaussians);
+            if (targetCount <= 0) {
+                src = filterSource(src, new Uint32Array(0), pool);
+                i++;
+                continue;
+            }
+            src = await decimateSourceVoxel(src, pool, {
+                ...options?.decimateVoxel,
+                targetCount,
+                coverageBoostScale: action.coverageBoostScale ?? options?.decimateVoxel?.coverageBoostScale
+            });
+            i++;
+            continue;
+        }
         const chunkNative = SOURCE_ACTION_KINDS.has(actions[i].kind);
         let j = i + 1;
         while (j < actions.length && SOURCE_ACTION_KINDS.has(actions[j].kind) === chunkNative) {
+            const next = actions[j];
+            if (next.kind === 'decimate' && next.method === 'voxel') break;
             j++;
         }
         const run = actions.slice(i, j);

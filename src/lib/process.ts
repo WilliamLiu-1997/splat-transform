@@ -5,6 +5,8 @@ import { dataTableToChunkSource, materializeToDataTable } from './compat/data-ta
 import { Column, DataTable, sortMortonOrder, convertToSpace, getSHBands } from './data-table';
 import type { Row } from './data-table';
 import { decimateSource } from './decimate-uniform';
+import { decimateSourceVoxel } from './decimate-voxel';
+import type { DecimateVoxelOptions } from './decimate-voxel';
 import { computeSourceStats } from './ops';
 import type { InputFormat } from './read';
 import { formatSourceInfo, formatSourceStats } from './source-info';
@@ -161,8 +163,9 @@ type MortonOrder = {
  * similar splats into single approximating Gaussians using Mass-Preserving
  * Moment Matching (MPMM), preserving scene structure and appearance.
  *
- * Removal is allocated at a uniform rate everywhere; for the adaptive variant
- * call `decimateSourceAdaptive()` directly.
+ * Removal is allocated at a uniform rate everywhere by default; for the adaptive
+ * variant call `decimateSourceAdaptive()` directly. The optional `voxel` method
+ * uses representative selection and opacity-area moment matching instead.
  */
 type Decimate = {
     /** Action type identifier. */
@@ -171,6 +174,10 @@ type Decimate = {
     count: number | null;
     /** Percentage of splats to keep (0-100), or null for count mode. */
     percent: number | null;
+    /** Simplifier to use. Default: uniform (the existing pairwise algorithm). */
+    method?: 'uniform' | 'voxel';
+    /** Display-only coverage strength for the voxel method. Default: 0.5. */
+    coverageBoostScale?: number;
 };
 
 /**
@@ -219,6 +226,8 @@ type ProcessOptions = {
     createDevice?: DeviceCreator;
     /** Input format reported by the `info`/`stats` actions; omitted when unset. */
     sourceFormat?: InputFormat;
+    /** Memory and spill storage for voxel decimation actions. */
+    decimateVoxel?: Omit<DecimateVoxelOptions, 'targetCount'>;
 };
 
 /**
@@ -561,10 +570,18 @@ const processDataTable = async (
                 // passes through so decimation shares the caller's cached GPU.
                 const pool = createChunkDataPool();
                 const src = dataTableToChunkSource(result);
-                const decimated = await decimateSource(src, pool, {
-                    targetCount: keepCount,
-                    createDevice: options?.createDevice
-                });
+                const decimated =
+                    processAction.method === 'voxel'
+                        ? await decimateSourceVoxel(src, pool, {
+                              ...options?.decimateVoxel,
+                              targetCount: keepCount,
+                              coverageBoostScale:
+                                  processAction.coverageBoostScale ?? options?.decimateVoxel?.coverageBoostScale
+                          })
+                        : await decimateSource(src, pool, {
+                              targetCount: keepCount,
+                              createDevice: options?.createDevice
+                          });
                 // The decimator works in PLY space (its spill/terminal format);
                 // convert back to the DataTable convention (identity space,
                 // pending transform baked). World-space result is unchanged —

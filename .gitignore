@@ -2,6 +2,7 @@ node_modules
 dist
 docs
 .DS_Store
+._*
 scenes/
 .cursor/
 .bench/

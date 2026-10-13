@@ -128,7 +128,12 @@ Actions execute in the order specified and can be repeated. Any action may appea
                                           second invocation). A deep target on a huge scene needs
                                           --scratch-dir for its intermediate levels; nothing is
                                           written to disk without it.
-    --scratch-dir      <path>           Directory for decimation intermediates (explicit only)
+    --decimate-voxel   <n|n%>           Simplify using adaptive voxels.
+                                          Must be the final action; supports any single-scene output.
+    --coverage-boost-scale <n>          Voxel output coverage adjustment. Default: 0.5; 0 disables it
+    --memory-budget   <MiB>            Decimation working-memory budget; excludes input and output encoding
+    --scratch-dir     <path>           Directory for decimation intermediates. Voxel simplification defaults
+                                          to the system temp directory and cleans up after writing.
 -F, --filter-floaters  [size,op,min]    Remove Gaussians not contributing to any solid voxel.
                                           Evaluates each Gaussian at occupied voxel centers.
                                           Default: size=0.05, opacity=0.1, min=0.004 (1/255).
@@ -215,6 +220,8 @@ Apply when reading `lod-meta.json`, `.lcc`, and `.lcc2` files.
 Apply when writing `lod-meta.json` (multi-LOD streaming SOG bundle).
 
 ```none
+    --lod-voxel        <n|n%,...>        Generate LODs using voxel simplification, keeping the input as LOD 0.
+                                          Decreasing counts or percentages of LOD 0, e.g. 50%,25%,12.5%.
     --lod-chunk-count  <n>              Approximate number of Gaussians per LOD chunk in K. Default: 512
     --lod-chunk-extent <n>              Approximate size of an LOD chunk in world units (m). Default: 16
     --lod-chunk-min    <n>              Gaussians in K below which a chunk is not split for extent. Default: 8
@@ -321,6 +328,9 @@ splat-transform input.ply output.sog
 # Convert to SOG unbundled format
 splat-transform input.ply output/meta.json
 
+# Generate Streamed SOG with voxel LODs at 100%, 50%, 25% and 12.5%
+splat-transform input.ply --lod-voxel 50%,25%,12.5% output/lod-meta.json
+
 # Convert from SOG (bundled) back to PLY
 splat-transform scene.sog restored.ply
 
@@ -367,6 +377,9 @@ splat-transform input.ply --decimate 50000 output.ply
 
 # Simplify to 25% of original splat count
 splat-transform input.ply -d 25% output.ply
+
+# Simplify using adaptive voxels and write SOG
+splat-transform input.ply --decimate-voxel 30% output.sog
 ```
 
 ### Advanced Usage

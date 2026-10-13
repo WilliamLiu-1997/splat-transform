@@ -1,5 +1,5 @@
-import { lstat, mkdir, readFile as pathReadFile, unlink } from 'node:fs/promises';
-import { totalmem } from 'node:os';
+import { lstat, mkdir, mkdtemp, readFile as pathReadFile, rm, unlink } from 'node:fs/promises';
+import { tmpdir, totalmem } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import process, { exit } from 'node:process';
 import { parseArgs } from 'node:util';
@@ -12,9 +12,11 @@ import {
     combine,
     concatSource,
     createChunkDataPool,
+    createVoxelLodSource,
     dataTableToChunkSource,
     decimateSource,
     decimateSourceAdaptive,
+    decimateSourceVoxel,
     fmtBytes,
     fmtCount,
     fmtTime,
@@ -78,8 +80,10 @@ type CliOptions = {
     listGpus: boolean;
     deviceIdx: number; // -1 = auto, -2 = CPU, 0+ = GPU index
     gpuBackend: string | undefined; // forced Dawn backend; undefined = platform default
-    scratchDir: string | undefined; // decimation intermediate location (explicit only, never defaulted)
-    memoryBudgetBytes: number; // decimation residency policy ceiling (not an allocation, not user-facing)
+    scratchDir: string | undefined; // optional decimation intermediate root
+    memoryBudgetBytes: number; // decimation working-data policy ceiling, not an allocation
+    coverageBoostScale: number;
+    lodVoxel: string[];
 } & LibOptions;
 
 const fileExists = async (filename: string) => {
@@ -137,7 +141,7 @@ const resolveInput = (arg: string): ResolvedInput => {
 // never dispatched as a data operation).
 type CliAction = ProcessAction | { kind: 'lod'; value: number };
 
-// `--decimate` and `--decimate-adaptive` both produce a decimate action, so
+// The decimation flags all produce a decimate action, so
 // which decimator to run rides on the action itself rather than on global
 // options — that way it always describes the action actually executed, with no
 // dependence on flag ordering or on the "exactly one decimate action" check.
@@ -175,6 +179,9 @@ const cliOptionsConfig = {
     'lod-chunk-extent': { type: 'string', default: '16' },
     'lod-chunk-min': { type: 'string', default: '8' },
     'lod-file-count': { type: 'string', default: '' },
+    'lod-voxel': { type: 'string' },
+    'coverage-boost-scale': { type: 'string', default: '0.5' },
+    'memory-budget': { type: 'string' },
     'spz-version': { type: 'string', default: '4' },
     unbundled: { type: 'boolean', default: false },
     'voxel-size': { type: 'string' },
@@ -217,6 +224,7 @@ const cliOptionsConfig = {
     'filter-sphere': { type: 'string', short: 'S', multiple: true },
     decimate: { type: 'string', short: 'd', multiple: true },
     'decimate-adaptive': { type: 'string', multiple: true },
+    'decimate-voxel': { type: 'string', multiple: true },
     'filter-cluster': { type: 'string', short: 'C', multiple: true },
     'filter-floaters': { type: 'string', short: 'F', multiple: true },
     params: { type: 'string', short: 'p', multiple: true },
@@ -599,7 +607,12 @@ const parseArguments = async () => {
         // Residency policy ceiling for decimation (not an upfront allocation).
         // Half the machine's RAM, capped at 48 GiB — derived here because the
         // library is node-free and cannot read os.totalmem() itself.
-        memoryBudgetBytes: Math.min(48 * 2 ** 30, Math.floor(totalmem() / 2)),
+        memoryBudgetBytes:
+            v['memory-budget'] === undefined
+                ? Math.min(48 * 2 ** 30, Math.floor(totalmem() / 2))
+                : parseNumber(v['memory-budget'], 1) * 2 ** 20,
+        coverageBoostScale: parseNumber(v['coverage-boost-scale'], 0),
+        lodVoxel: v['lod-voxel'] === undefined ? [] : v['lod-voxel'].split(',').map((v) => v.trim()),
         // The image writer's GPU-resident copy of the scene shares RAM with the
         // in-memory table on unified-memory machines, so bound it the same way.
         renderResidentBudget: Math.min(48 * 2 ** 30, Math.floor(totalmem() / 2)),
@@ -785,7 +798,8 @@ const parseArguments = async () => {
                     });
                     break;
                 case 'decimate':
-                case 'decimate-adaptive': {
+                case 'decimate-adaptive':
+                case 'decimate-voxel': {
                     const value = t.value.trim();
                     let count: number | null = null;
                     let percent: number | null = null;
@@ -808,7 +822,10 @@ const parseArguments = async () => {
                         kind: 'decimate',
                         count,
                         percent,
-                        adaptive: t.name === 'decimate-adaptive'
+                        adaptive: t.name === 'decimate-adaptive',
+                        ...(t.name === 'decimate-voxel'
+                            ? { method: 'voxel' as const, coverageBoostScale: options.coverageBoostScale }
+                            : {})
                     };
                     current.processActions.push(decimate);
                     break;
@@ -893,8 +910,13 @@ ACTIONS (executed in order; can be repeated)
         --decimate-adaptive <n|n%>          Simplify, allocating removal by local error (adaptive).
                                               Much better on mixed-scale content such as skies.
                                               Either must be the final action, with a .ply output
-        --scratch-dir      <path>           Directory for intermediate levels when a deep decimation
-                                              target exceeds memory. Nothing is written without it
+        --decimate-voxel   <n|n%>           Simplify using adaptive voxels.
+                                              Final action; supports any single-scene output
+        --coverage-boost-scale <n>          Voxel display coverage strength. Default: 0.5; 0 disables it
+        --memory-budget   <MiB>            Decimation working-memory budget (excludes input and output encoding)
+        --scratch-dir     <path>           Intermediate storage root. Voxel uses an isolated temporary directory
+                                              here or in the system temp directory, cleaned after writing.
+                                              Uniform/adaptive spill only when this option is supplied
     -F, --filter-floaters  [size,op,min]    Remove Gaussians not contributing to any solid voxel. Default: 0.05,0.1,0.004
     -C, --filter-cluster   [res,op,min]     Keep only the connected cluster at --seed-pos. Default: 1.0,0.999,0.1
     -p, --params           <key=val,...>    Pass parameters to .mjs generator script
@@ -936,6 +958,8 @@ LOD INPUT (lod-meta.json, .lcc, .lcc2)
     -L, --select-lod       <n,n,...>        Comma-separated LOD levels to read from streamed SOG / LCC / LCC2 input
 
 LOD OUTPUT (lod-meta.json)
+        --lod-voxel       <n|n%,...>        Generate voxel LODs from one level; counts/percentages refer to LOD 0.
+                                              Example: 50%,25%,12.5%. Original input remains LOD 0
         --lod-chunk-count  <n>              Approximate number of Gaussians per LOD chunk in K. Default: 512
         --lod-chunk-extent <n>              Approximate size of an LOD chunk in world units (m). Default: 16
         --lod-chunk-min    <n>              Gaussians in K below which a chunk is not split for extent. Default: 8
@@ -1216,7 +1240,33 @@ const main = async () => {
         }
     }
 
+    let voxelScratchDir: string | undefined;
+    let voxelResult: ChunkSource | undefined;
+    const voxelSpill = async () => {
+        if (!voxelScratchDir) {
+            const root = options.scratchDir ?? tmpdir();
+            await mkdir(root, { recursive: true });
+            voxelScratchDir = await mkdtemp(join(root, 'splat-transform-voxel-'));
+        }
+        return {
+            writeFs: new NodeFileSystem(),
+            readFs: new NodeReadFileSystem(),
+            scratchDir: voxelScratchDir,
+            remove: (path: string) => unlink(path)
+        };
+    };
+    const closeVoxel = async () => {
+        try {
+            await voxelResult?.close();
+        } finally {
+            if (voxelScratchDir) await rm(voxelScratchDir, { recursive: true, force: true });
+        }
+    };
+
     try {
+        if (options.lodVoxel.length > 0 && outputFormat !== 'lod') {
+            throw new Error('--lod-voxel requires lod-meta.json output');
+        }
         // GPU device creator (cached): used by processSourceBridged's DataTable-island
         // ops (decimate / voxel filters) and the GPU writers (image / voxel).
         // deviceIdx: -1 = auto, -2 = CPU, 0+ = specific GPU index
@@ -1280,20 +1330,22 @@ const main = async () => {
         // write). A --tag-lod tag on single-scene output is rejected after the LOD path.
         const singleSceneActions = [...inputArgs.flatMap((a) => a.processActions), ...outputArg.processActions];
 
-        // v1 decimation is terminal: the merge stream writes straight into the
-        // destination, so decimate must be the last action and the output must
-        // be plain PLY. Anything else needs two invocations (decimate to PLY,
-        // then convert).
+        // Uniform/adaptive decimation streams once into a PLY terminal. Voxel
+        // results support gathers and repeated reads, so any single-scene writer
+        // can consume them directly. CLI decimation remains a final action.
         const decimateIdx = singleSceneActions.map((a, i) => (a.kind === 'decimate' ? i : -1)).filter((i) => i >= 0);
         if (decimateIdx.length > 0) {
+            const voxel = (singleSceneActions[decimateIdx[0]] as CliDecimate).method === 'voxel';
             const ok =
                 decimateIdx.length === 1 &&
                 decimateIdx[0] === singleSceneActions.length - 1 &&
                 !isNullOutput &&
-                outputFormat === 'ply';
+                (voxel ? outputFormat !== 'lod' : outputFormat === 'ply');
             if (!ok) {
                 failExit(
-                    '--decimate must be the final action and the output must be .ply ' +
+                    (voxel
+                        ? '--decimate-voxel must be the final action with a single-scene output; use --lod-voxel for lod-meta.json '
+                        : '--decimate must be the final action and the output must be .ply ') +
                         `(got ${isNullOutput ? 'no output' : `.${outputFormat}`}${decimateIdx[0] !== singleSceneActions.length - 1 || decimateIdx.length > 1 ? ', with actions after decimate' : ''}). ` +
                         'Write a decimated PLY first, then convert in a second invocation.'
                 );
@@ -1425,8 +1477,8 @@ const main = async () => {
                 if (keepCount < 1) {
                     failExit(`--decimate target resolves to ${keepCount} gaussians; must keep at least 1`);
                 }
-                // Explicit only: a deep target that exceeds the memory budget fails
-                // rather than writing intermediates somewhere the user did not name.
+                // Existing uniform/adaptive spill policy remains explicit-only.
+                // Voxel uses its own isolated workspace below.
                 const spill = options.scratchDir
                     ? {
                           writeFs: new NodeFileSystem(),
@@ -1435,19 +1487,28 @@ const main = async () => {
                           remove: (path: string) => unlink(path)
                       }
                     : undefined;
-                combined = decimateAction.adaptive
-                    ? await decimateSourceAdaptive(combined, pool, {
-                          targetCount: keepCount,
-                          createDevice: deviceCreator,
-                          memoryBudgetBytes: options.memoryBudgetBytes,
-                          spill
-                      })
-                    : await decimateSource(combined, pool, {
-                          targetCount: keepCount,
-                          createDevice: deviceCreator,
-                          memoryBudgetBytes: options.memoryBudgetBytes,
-                          spill
-                      });
+                combined =
+                    decimateAction.method === 'voxel'
+                        ? await decimateSourceVoxel(combined, pool, {
+                              targetCount: keepCount,
+                              coverageBoostScale: options.coverageBoostScale,
+                              memoryBudgetBytes: options.memoryBudgetBytes,
+                              spill: await voxelSpill()
+                          })
+                        : decimateAction.adaptive
+                          ? await decimateSourceAdaptive(combined, pool, {
+                                targetCount: keepCount,
+                                createDevice: deviceCreator,
+                                memoryBudgetBytes: options.memoryBudgetBytes,
+                                spill
+                            })
+                          : await decimateSource(combined, pool, {
+                                targetCount: keepCount,
+                                createDevice: deviceCreator,
+                                memoryBudgetBytes: options.memoryBudgetBytes,
+                                spill
+                            });
+                if (decimateAction.method === 'voxel') voxelResult = combined;
             }
 
             logger.info(`${fmtCount(combined.meta.numGaussians)} gaussians · ${combined.meta.shBands} SH bands`);
@@ -1467,6 +1528,7 @@ const main = async () => {
             }
 
             await combined.close();
+            await closeVoxel();
             phase.end();
             reportDone();
             exit(0);
@@ -1571,7 +1633,30 @@ const main = async () => {
                     perLevel = perLevel.map((s) => bakeTransform(s, Transform.IDENTITY));
                 }
             }
-            const mainSource = perLevel.length === 1 ? perLevel[0] : stackLods(perLevel);
+            let mainSource = perLevel.length === 1 ? perLevel[0] : stackLods(perLevel);
+            if (options.lodVoxel.length > 0) {
+                if (mainSource.meta.numLods !== 1) {
+                    throw new Error(
+                        '--lod-voxel generates from one level; use --select-lod to select a single input LOD'
+                    );
+                }
+                const n = mainSource.meta.numGaussians;
+                const targetCounts = options.lodVoxel.map((value) => {
+                    if (!/^\d+(?:\.\d+)?%$|^\d+$/.test(value)) {
+                        throw new Error(
+                            `Invalid --lod-voxel target: ${value}. Use counts or percentages, for example 50%,25%.`
+                        );
+                    }
+                    return value.endsWith('%') ? Math.round((n * Number(value.slice(0, -1))) / 100) : Number(value);
+                });
+                mainSource = await createVoxelLodSource(mainSource, pool, {
+                    targetCounts,
+                    coverageBoostScale: options.coverageBoostScale,
+                    memoryBudgetBytes: options.memoryBudgetBytes,
+                    spill: await voxelSpill()
+                });
+                voxelResult = mainSource;
+            }
             const total = mainSource.meta.lodCounts.reduce((a, c) => a + c, 0);
             if (total === 0) {
                 throw new Error('No Gaussians to write');
@@ -1600,6 +1685,7 @@ const main = async () => {
             await mainSource.close();
             if (container) await container.close();
             if (envSource) await envSource.close();
+            await closeVoxel();
             phase.end();
             reportDone();
             exit(0);
@@ -1613,6 +1699,7 @@ const main = async () => {
             '--tag-lod tags apply to lod-meta.json output; for single-scene output choose a level with --select-lod (-L).'
         );
     } catch (err) {
+        await closeVoxel();
         failExit(err);
     }
 

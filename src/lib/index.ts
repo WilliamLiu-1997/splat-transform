@@ -61,6 +61,9 @@ export type { DecimateOptions, DecimateSpill } from './decimate-uniform';
 export { decimateSourceAdaptive } from './decimate';
 export type { DecimateAdaptiveOptions, DecimateAdaptiveSpill } from './decimate';
 
+export { decimateSourceVoxel, createVoxelLodSource } from './decimate-voxel';
+export type { DecimateVoxelOptions, VoxelLodOptions, VoxelSpill } from './decimate-voxel';
+
 // Statistics
 export { computeStats } from './stats';
 export type { LodStats, LodStatsData, SourceStats } from './stats';
